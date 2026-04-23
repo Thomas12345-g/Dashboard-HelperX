@@ -5,9 +5,11 @@ import logging
 import traceback
 import shutil
 import sys
-import threading
 import asyncio
-from typing import Optional
+from dotenv import load_dotenv
+
+# Lade Environment Variablen
+load_dotenv()
 
 # Cache löschen
 if os.path.exists("./features/__pycache__"):
@@ -23,7 +25,7 @@ logging.basicConfig(
 # ══════════════════════════════════════════════════════════════════════════════
 #  MODUS
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_MODE = "public"  # ← sofortiger Sync, kein Warten!
+BOT_MODE = os.getenv("BOT_MODE", "public")  # ← jetzt über .env konfigurierbar
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SERVER-IDs
@@ -40,15 +42,18 @@ GUILD_IDS = [
 BOT_VERSION = "9.9"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  API-KEYS — Aus Umgebungsvariablen (kein Hardcoding mehr!)
+#  API-KEYS — Jetzt sicher über Environment Variablen
 # ══════════════════════════════════════════════════════════════════════════════
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # KEIN Hardcoded Token mehr!
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Prüfen ob Token vorhanden ist
+# Prüfe ob Token vorhanden ist
 if not DISCORD_TOKEN:
-    logging.error("❌ DISCORD_TOKEN nicht in Umgebungsvariablen gefunden!")
-    raise ValueError("DISCORD_TOKEN environment variable is required")
+    logging.error("❌ DISCORD_TOKEN nicht in .env Datei gefunden!")
+    sys.exit(1)
+
+if not GROQ_API_KEY:
+    logging.warning("⚠️ GROQ_API_KEY nicht in .env Datei gefunden -某些 Funktionen könnten nicht arbeiten")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  INTENTS
@@ -57,35 +62,39 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# Globale Bot-Instanz (wird beim Import erstellt)
-bot: Optional[commands.Bot] = None
-_bot_started = False
-_bot_thread: Optional[threading.Thread] = None
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  GLOBALE VARIABLEN FÜR WEB-INTERFACE
+# ══════════════════════════════════════════════════════════════════════════════
+bot_instance = None  # Wird für Flask-Zugriff verwendet
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BOT-KLASSE
 # ══════════════════════════════════════════════════════════════════════════════
 class MyBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.groq_api_key = GROQ_API_KEY
+        
     async def setup_hook(self):
         logging.info("🔧 setup_hook gestartet...")
         logging.info(f"🌐 BOT_MODE: {BOT_MODE}")
 
+        # Lade Features, falls vorhanden
         features_dir = "./features"
-        if not os.path.exists(features_dir):
-            logging.error(f"❌ Features-Verzeichnis '{features_dir}' nicht gefunden.")
-            return
+        if os.path.exists(features_dir):
+            for filename in sorted(os.listdir(features_dir)):
+                if filename.endswith(".py") and not filename.startswith("__"):
+                    ext = f"features.{filename[:-3]}"
+                    try:
+                        await self.load_extension(ext)
+                        logging.info(f"✅ Feature '{filename}' geladen.")
+                    except Exception:
+                        logging.error(f"❌ Fehler beim Laden von '{filename}':")
+                        traceback.print_exc()
+        else:
+            logging.info("📁 Kein 'features' Verzeichnis gefunden - fahre ohne Cogs fort")
 
-        for filename in sorted(os.listdir(features_dir)):
-            if filename.endswith(".py"):
-                ext = f"features.{filename[:-3]}"
-                try:
-                    await self.load_extension(ext)
-                    logging.info(f"✅ Feature '{filename}' geladen.")
-                except Exception:
-                    logging.error(f"❌ Fehler beim Laden von '{filename}':")
-                    traceback.print_exc()
-
+        # Sync Commands basierend auf Modus
         if BOT_MODE == "dev":
             for gid in GUILD_IDS:
                 guild = discord.Object(id=gid)
@@ -100,7 +109,7 @@ class MyBot(commands.Bot):
                     traceback.print_exc()
 
         elif BOT_MODE == "public":
-            # ── 1) Globale Commands syngen ─────────────────────────────────
+            # Globale Commands syngen
             try:
                 synced = await self.tree.sync()
                 logging.info(
@@ -111,7 +120,7 @@ class MyBot(commands.Bot):
                 logging.error("❌ Globaler Sync-Fehler:")
                 traceback.print_exc()
 
-            # ── 2) Guild-spezifische Commands syngen ─────────────────
+            # Guild-spezifische Commands syngen
             for gid in GUILD_IDS:
                 guild = discord.Object(id=gid)
                 try:
@@ -123,198 +132,106 @@ class MyBot(commands.Bot):
                 except Exception:
                     logging.error(f"❌ Guild-Sync-Fehler für {gid}:")
                     traceback.print_exc()
-
         else:
             logging.error(f"❌ Unbekannter BOT_MODE: '{BOT_MODE}'")
 
+    async def on_ready(self):
+        logging.info(f"✅ {self.user} ist online! (v{BOT_VERSION} | Modus: {BOT_MODE})")
+        logging.info(f"📋 Registrierte Commands: {[c.name for c in self.tree.get_commands()]}")
+        logging.info(f"🏠 Aktive Server: {len(self.guilds)}")
+        
+        # Setze Status
+        await self.change_presence(
+            activity=discord.Game(name=f"HelperXBot v{BOT_VERSION} | /help")
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BOT INITIALISIEREN (global verfügbar)
+#  BOT INITIALISIEREN
 # ══════════════════════════════════════════════════════════════════════════════
-def create_bot_instance() -> MyBot:
-    """Erstellt und konfiguriert eine Bot-Instanz"""
-    bot_instance = MyBot(command_prefix="!", intents=intents)
-    
-    @bot_instance.event
-    async def on_ready():
-        logging.info(f"✅ {bot_instance.user} ist online! (v{BOT_VERSION} | Modus: {BOT_MODE})")
-        logging.info(f"📋 Registrierte Commands: {[c.name for c in bot_instance.tree.get_commands()]}")
-        logging.info(f"🏠 Aktive Server: {len(bot_instance.guilds)}")
-
-        post_changelog = getattr(bot_instance, "_helperx_post_changelog", None)
-        if post_changelog:
-            for gid in GUILD_IDS:
-                guild = bot_instance.get_guild(gid)
-                if guild:
-                    try:
-                        await post_changelog(guild)
-                        logging.info(f"✅ Changelog gepostet (Guild {gid}).")
-                    except Exception:
-                        traceback.print_exc()
-                else:
-                    logging.warning(f"⚠️  Guild {gid} nicht gefunden – Changelog übersprungen.")
-        else:
-            logging.warning("⚠️  _helperx_post_changelog nicht registriert.")
-    
-    return bot_instance
-
-# Bot-Instanz global erstellen (beim Import)
-bot = create_bot_instance()
-
+bot = MyBot()
+bot_instance = bot  # Für Zugriff von aussen (z.B. Flask)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HELPER-FUNKTIONEN FÜR EXTERNE ZUGRIFFE
+#  EINFACHE BEFEHLE FÜR TESTZECKE
 # ══════════════════════════════════════════════════════════════════════════════
+@bot.tree.command(name="ping", description="Teste die Bot-Latenz")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Pong! 🏓 Latenz: {round(bot.latency * 1000)}ms")
 
-def is_bot_ready() -> bool:
-    """Prüft ob der Bot bereit ist"""
-    return bot.is_ready() if bot else False
-
-
-def send_message_sync(channel_id: int, message: str) -> bool:
-    """
-    Synchroner Wrapper zum Senden von Nachrichten.
-    Kann in Flask-Routen verwendet werden.
-    
-    Args:
-        channel_id: Discord Channel ID
-        message: Zu sendende Nachricht
-    
-    Returns:
-        bool: Erfolg oder Fehlschlag
-    """
-    if not bot or not bot.is_ready():
-        logging.error("Bot ist nicht bereit zum Senden von Nachrichten")
-        return False
-    
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        logging.error(f"Channel {channel_id} nicht gefunden")
-        return False
-    
-    # Coroutine im Bot-Event-Loop ausführen
-    future = asyncio.run_coroutine_threadsafe(
-        channel.send(message),
-        bot.loop
+@bot.tree.command(name="info", description="Zeige Bot-Informationen")
+async def info(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🤖 HelperXBot",
+        description=f"Version {BOT_VERSION}",
+        color=discord.Color.blue()
     )
-    
-    try:
-        future.result(timeout=10)  # 10 Sekunden Timeout
-        return True
-    except Exception as e:
-        logging.error(f"Fehler beim Senden der Nachricht: {e}")
-        return False
+    embed.add_field(name="Bot Name", value=bot.user.name, inline=True)
+    embed.add_field(name="Bot ID", value=bot.user.id, inline=True)
+    embed.add_field(name="Server", value=len(bot.guilds), inline=True)
+    embed.add_field(name="Modus", value=BOT_MODE, inline=True)
+    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    await interaction.response.send_message(embed=embed)
 
-
-def send_dm_sync(user_id: int, message: str) -> bool:
-    """
-    Synchroner Wrapper zum Senden von Direktnachrichten.
+@bot.tree.command(name="avatar", description="Zeige den Avatar eines Users")
+async def avatar(interaction: discord.Interaction, member: discord.Member = None):
+    if member is None:
+        member = interaction.user
     
-    Args:
-        user_id: Discord User ID
-        message: Zu sendende Nachricht
-    
-    Returns:
-        bool: Erfolg oder Fehlschlag
-    """
-    if not bot or not bot.is_ready():
-        logging.error("Bot ist nicht bereit zum Senden von Nachrichten")
-        return False
-    
-    user = bot.get_user(user_id)
-    if not user:
-        logging.error(f"User {user_id} nicht gefunden")
-        return False
-    
-    future = asyncio.run_coroutine_threadsafe(
-        user.send(message),
-        bot.loop
+    embed = discord.Embed(
+        title=f"{member.name}'s Avatar",
+        color=discord.Color.blue()
     )
-    
+    embed.set_image(url=member.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ON READY EVENT (Wurde bereits in MyClass definiert, aber wir fügen hinzu)
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.event
+async def on_ready():
+    # Dieser Event-Handler überschreibt den in MyBot, also rufen wir die Parent-Methode auf
+    pass  # Wird bereits von MyBot.on_ready() behandelt
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FUNKTION FÜR FLASK (UM BOT-ZUGRIFF ZU ERMÖGLICHEN)
+# ══════════════════════════════════════════════════════════════════════════════
+def get_bot_stats():
+    """Gibt Bot-Statistiken für das Web-Interface zurück"""
+    if bot_instance and bot_instance.is_ready():
+        return {
+            "status": "online",
+            "username": str(bot_instance.user),
+            "guilds": len(bot_instance.guilds),
+            "users": sum(guild.member_count for guild in bot_instance.guilds),
+            "version": BOT_VERSION,
+            "mode": BOT_MODE,
+            "latency": round(bot_instance.latency * 1000)
+        }
+    return {"status": "offline"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  START
+# ══════════════════════════════════════════════════════════════════════════════
+def run_bot():
+    """Startet den Bot (für separate Ausführung)"""
     try:
-        future.result(timeout=10)
-        return True
+        bot.run(DISCORD_TOKEN)
+    except discord.LoginFailure:
+        logging.error("❌ Fehler: Ungültiger Discord Token!")
+        sys.exit(1)
     except Exception as e:
-        logging.error(f"Fehler beim Senden der DM: {e}")
-        return False
+        logging.error(f"❌ Unerwarteter Fehler: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
+async def start_bot():
+    """Startet den Bot asynchron (für Integration mit Flask)"""
+    async with bot:
+        await bot.start(DISCORD_TOKEN)
 
-async def send_message_async(channel_id: int, message: str) -> bool:
-    """
-    Asynchrone Version zum Senden von Nachrichten.
-    Für Verwendung in anderen async-Funktionen.
-    """
-    if not bot or not bot.is_ready():
-        return False
-    
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        return False
-    
-    try:
-        await channel.send(message)
-        return True
-    except Exception as e:
-        logging.error(f"Fehler beim async Senden: {e}")
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BOT-START (NICHT-BLOCKIEREND)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def start_bot() -> bool:
-    """
-    Startet den Discord-Bot in einem separaten Thread.
-    Diese Funktion blockiert nicht und kann parallel zu Flask verwendet werden.
-    
-    Returns:
-        bool: True wenn Start erfolgreich initiiert, False wenn Bot bereits läuft
-    """
-    global _bot_started, _bot_thread
-    
-    if _bot_started:
-        logging.warning("Bot wurde bereits gestartet")
-        return False
-    
-    def run_bot():
-        try:
-            logging.info("🚀 Starte Discord-Bot im Hintergrund-Thread...")
-            bot.run(DISCORD_TOKEN)
-        except Exception as e:
-            logging.error(f"❌ Bot-Fehler im Thread: {e}")
-            traceback.print_exc()
-    
-    _bot_thread = threading.Thread(target=run_bot, daemon=True)
-    _bot_thread.start()
-    _bot_started = True
-    
-    logging.info("✅ Bot-Start im Hintergrund initiiert")
-    return True
-
-
-def stop_bot():
-    """Stoppt den Bot (sofern möglich)"""
-    global _bot_started
-    
-    if bot and bot.is_ready():
-        asyncio.run_coroutine_threadsafe(bot.close(), bot.loop)
-        _bot_started = False
-        logging.info("🛑 Bot wird gestoppt...")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN (NUR BEI DIREKTER AUSFÜHRUNG)
-# ══════════════════════════════════════════════════════════════════════════════
 def main():
-    """Wird nur ausgeführt wenn bot.py direkt gestartet wird"""
-    logging.info("Bot wird direkt gestartet (nicht als Modul)")
-    start_bot()
-    
-    # Hier blockieren und auf Thread warten
-    if _bot_thread:
-        _bot_thread.join()
-
+    """Hauptfunktion für direkte Ausführung"""
+    run_bot()
 
 if __name__ == "__main__":
     main()
